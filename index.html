@@ -247,6 +247,7 @@ table.scores tr.me td { background: rgba(201,160,74,.1); }
           <button class="toggle" id="tg-sound"><span>Sound</span><span>On</span></button>
           <button class="toggle" id="tg-mouse"><span>Mouse and trackpad</span><span>Follow pointer</span></button>
           <button class="toggle" id="tg-motion" hidden><span>Tilt with the iPad</span><span>On</span></button>
+          <button class="toggle" id="tg-flip" hidden><span>Tilt direction</span><span>Normal</span></button>
         </div>
         <div class="row end"><button class="btn" id="btn-switch">Switch player</button></div>
       </div>
@@ -676,7 +677,33 @@ table.scores tr.me td { background: rgba(201,160,74,.1); }
     return { ok: false, time: w.t, total, falls, fallHoles, x: w.x, y: w.y };
   }
 
-  const api = { T, R, HOLE_R, GOAL_R, BUMP_R, BTN_R, P, parseLevel, createWorld, step, solve, makePilot, runPilot, moverOffset, gateSolid, doorOpen };
+  // ---------------- Device tilt ----------------
+  // Which way is down, as a unit vector in the device's own axes (x to the right edge, y to the top edge,
+  // z out of the screen), from a deviceorientation event. Works at any holding angle, unlike raw beta/gamma.
+  function gravityFromEuler(betaDeg, gammaDeg) {
+    const b = betaDeg * Math.PI / 180, g = gammaDeg * Math.PI / 180;
+    return { x: Math.cos(b) * Math.sin(g), y: -Math.sin(b), z: -Math.cos(b) * Math.cos(g) };
+  }
+  // Screen axes in device coordinates for a screen turned `angle` degrees counter-clockwise
+  // (window.orientation: 0 portrait, 90 landscape with the top edge on the left, -90/270 the other landscape).
+  function screenAxes(angle) {
+    const a = (((angle % 360) + 360) % 360) * Math.PI / 180, c = Math.round(Math.cos(a)), s = Math.round(Math.sin(a));
+    return { right: { x: c, y: -s, z: 0 }, down: { x: -s, y: -c, z: 0 } };
+  }
+  const dot = (a, b) => a.x * b.x + a.y * b.y + a.z * b.z;
+  const unit = v => { const l = Math.hypot(v.x, v.y, v.z) || 1; return { x: v.x / l, y: v.y / l, z: v.z / l }; };
+  const minus = (a, k, b) => ({ x: a.x - k * b.x, y: a.y - k * b.y, z: a.z - k * b.z });
+  // Board tilt in screen terms, relative to the calibrated "flat" pose `ref` (both gravity vectors).
+  // Returns the sine of the tilt toward screen-right and screen-down (positive rolls the ball that way).
+  function tiltFromGravity(g, ref, angle) {
+    const n = unit(ref), ax = screenAxes(angle);
+    const ex = unit(minus(ax.right, dot(ax.right, n), n));
+    let ey = minus(ax.down, dot(ax.down, n), n); ey = unit(minus(ey, dot(ey, ex), ex));
+    const gu = unit(g);
+    return [dot(gu, ex), dot(gu, ey)];
+  }
+
+  const api = { T, R, HOLE_R, GOAL_R, BUMP_R, BTN_R, P, parseLevel, createWorld, step, solve, makePilot, runPilot, moverOffset, gateSolid, doorOpen, gravityFromEuler, screenAxes, tiltFromGravity };
   if (typeof module !== 'undefined' && module.exports) module.exports = api; else root.TiltEngine = api;
 })(typeof globalThis !== 'undefined' ? globalThis : this);
 </script>
@@ -1352,19 +1379,20 @@ table.scores tr.me td { background: rgba(201,160,74,.1); }
   stage.addEventListener('pointerleave', e => { if (e.pointerType === 'mouse') Input.pointer = null; });
   document.addEventListener('touchmove', e => { if (!e.target.closest('.card')) e.preventDefault(); }, { passive: false });
 
+  // Screen rotation, counter-clockwise from portrait. iPad Safari's window.orientation is the reliable source;
+  // screen.orientation.angle is only a fallback for browsers without it.
+  function screenAngle() {
+    if (typeof window.orientation === 'number') return window.orientation;
+    if (screen.orientation && typeof screen.orientation.angle === 'number') return screen.orientation.angle;
+    return 0;
+  }
   function onOrientation(e) {
     if (e.beta == null || e.gamma == null) return;
-    const ang = (screen.orientation && typeof screen.orientation.angle === 'number') ? screen.orientation.angle : (typeof window.orientation === 'number' ? window.orientation : 0);
-    let tx, ty;
-    const a = ((ang % 360) + 360) % 360;
-    if (a === 90) { tx = e.beta; ty = -e.gamma; }
-    else if (a === 270) { tx = -e.beta; ty = e.gamma; }
-    else if (a === 180) { tx = -e.gamma; ty = -e.beta; }
-    else { tx = e.gamma; ty = e.beta; }
     const m = Input.motion;
-    m.raw = { tx, ty, a };
-    if (!m.available) { m.available = true; m.ref = { tx, ty, a }; onMotionReady(); }
-    if (m.ref && m.ref.a !== a) m.ref = { tx, ty, a };
+    const g = E.gravityFromEuler(e.beta, e.gamma);
+    // light smoothing so sensor jitter doesn't shake the ball
+    m.raw = m.raw ? { x: m.raw.x + (g.x - m.raw.x) * 0.5, y: m.raw.y + (g.y - m.raw.y) * 0.5, z: m.raw.z + (g.z - m.raw.z) * 0.5 } : g;
+    if (!m.available) { m.available = true; m.ref = Object.assign({}, m.raw); onMotionReady(); }
   }
   function recenter() { const m = Input.motion; if (m.raw) m.ref = Object.assign({}, m.raw); toast('Board leveled'); }
   function startMotion() {
@@ -1382,7 +1410,7 @@ table.scores tr.me td { background: rgba(201,160,74,.1); }
   function onMotionReady() {
     Input.motion.active = Store.data.settings.motion !== false;
     $('btn-level').hidden = !Input.motion.active;
-    $('tg-motion').hidden = false;
+    $('tg-motion').hidden = false; $('tg-flip').hidden = false;
     refreshToggles();
     if (Input.motion.active) toast('Tilt the iPad to roll the ball');
   }
@@ -1401,9 +1429,12 @@ table.scores tr.me td { background: rgba(201,160,74,.1); }
     }
     const m = Input.motion;
     if (m.active && m.raw && m.ref) {
-      const FULL = 13, DZ = 0.6;
-      const dz = v => Math.abs(v) < DZ ? 0 : v - Math.sign(v) * DZ;
-      return [clamp(dz(m.raw.tx - m.ref.tx) / FULL, -1, 1), clamp(dz(m.raw.ty - m.ref.ty) / FULL, -1, 1)];
+      // sine of the board's tilt toward screen-right and screen-down; full tilt at 12 degrees
+      const v = E.tiltFromGravity(m.raw, m.ref, screenAngle());
+      const FULL = Math.sin(12 * Math.PI / 180), DZ = Math.sin(0.7 * Math.PI / 180);
+      const dz = x => Math.abs(x) < DZ ? 0 : x - Math.sign(x) * DZ;
+      const k = Store.data.settings.flip ? -1 : 1;
+      return [k * clamp(dz(v[0]) / FULL, -1, 1), k * clamp(dz(v[1]) / FULL, -1, 1)];
     }
     if (Input.pointer) {
       const dz = v => Math.abs(v) < 0.06 ? 0 : (v - Math.sign(v) * 0.06) / 0.94;
@@ -1617,6 +1648,7 @@ table.scores tr.me td { background: rgba(201,160,74,.1); }
     $('tg-sound').lastElementChild.textContent = Sound.on ? 'On' : 'Off';
     $('tg-mouse').lastElementChild.textContent = st.mouse === 'follow' ? 'Follow pointer' : 'Click and drag';
     $('tg-motion').lastElementChild.textContent = Input.motion.active ? 'On' : 'Off';
+    $('tg-flip').lastElementChild.textContent = st.flip ? 'Reversed' : 'Normal';
     $('btn-sound').setAttribute('aria-pressed', String(Sound.on));
   }
 
@@ -1649,6 +1681,7 @@ table.scores tr.me td { background: rgba(201,160,74,.1); }
   $('tg-guide').addEventListener('click', () => { Store.data.settings.guide = Store.data.settings.guide === false; Store.save(); buildStatic(); refreshToggles(); });
   $('tg-sound').addEventListener('click', () => { Sound.init(); Sound.setOn(!Sound.on); Store.data.settings.sound = Sound.on; Store.save(); refreshToggles(); });
   $('tg-mouse').addEventListener('click', () => { Store.data.settings.mouse = Store.data.settings.mouse === 'follow' ? 'drag' : 'follow'; Input.pointer = null; Store.save(); refreshToggles(); });
+  $('tg-flip').addEventListener('click', () => { Store.data.settings.flip = !Store.data.settings.flip; Store.save(); refreshToggles(); });
   $('tg-motion').addEventListener('click', () => {
     Input.motion.active = !Input.motion.active; Store.data.settings.motion = Input.motion.active; Store.save();
     $('btn-level').hidden = !Input.motion.active; if (Input.motion.active && Input.motion.raw) Input.motion.ref = Object.assign({}, Input.motion.raw); refreshToggles();
